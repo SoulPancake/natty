@@ -3,64 +3,84 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"os"
 	"time"
 
-	"github.com/nats-io/jsm.go/natscontext"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-var isLeader = false
-var name string
-var rev uint64
-
 func main() {
-	name = "os.Args[1]"
-	ctx := context.Background()
-	log.SetPrefix(fmt.Sprintf("[%s] ", name))
-	nc, err := natscontext.Connect(natscontext.SelectedContext(), nats.Name(name))
-	if err != nil {
-		log.Fatalln(err)
+	url := os.Getenv(nats.DefaultURL)
+	if url == "" {
+		url = nats.DefaultURL
 	}
 
-	js, err := jetstream.New(nc)
-	if err != nil {
-		log.Fatalln(err)
-	}
+	nc, _ := nats.Connect(url)
+	defer nc.Drain()
 
-	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:   "leadership",
-		TTL:      time.Second * 3,
-		MaxBytes: 1024 * 1024,
+	js, _ := jetstream.New(nc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	kv, _ := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "profiles",
 	})
-	if err != nil {
-		log.Fatalln(err)
-	}
 
-	log.Println("Trying to assume leadership...")
-	for {
-		time.Sleep(1 * time.Second)
+	kv.Put(ctx, "sue.color", []byte("blue"))
+	entry, _ := kv.Get(ctx, "sue.color")
+	fmt.Printf("%s @ %d -> %q\n", entry.Key(), entry.Revision(), string(entry.Value()))
 
-		if isLeader {
+	kv.Put(ctx, "sue.color", []byte("green"))
+	entry, _ = kv.Get(ctx, "sue.color")
+	fmt.Printf("%s @ %d -> %q\n", entry.Key(), entry.Revision(), string(entry.Value()))
 
-			// Refresh lock
-			rev, err = kv.Update(ctx, "leader", []byte(name), rev)
-			if err != nil {
-				log.Println("Lost leadership:", err)
-				isLeader = false
-			}
-			continue
-		} else {
+	_, err := kv.Update(ctx, "sue.color", []byte("red"), 1)
+	fmt.Printf("expected error: %s\n", err)
 
-			// Obtain lock
-			rev, err = kv.Create(ctx, "leader", []byte(name))
-			if err != nil {
-				continue
-			}
+	kv.Update(ctx, "sue.color", []byte("red"), 2)
+	entry, _ = kv.Get(ctx, "sue.color")
+	fmt.Printf("%s @ %d -> %q\n", entry.Key(), entry.Revision(), string(entry.Value()))
 
-			log.Println("Became Leader")
-			isLeader = true
-		}
-	}
+	name := <-js.StreamNames(ctx).Name()
+	fmt.Printf("KV stream name: %s\n", name)
+
+	cons, _ := js.CreateOrUpdateConsumer(ctx, "KV_profiles", jetstream.ConsumerConfig{
+		AckPolicy: jetstream.AckNonePolicy,
+	})
+
+	msg, _ := cons.Next()
+	md, _ := msg.Metadata()
+	fmt.Printf("%s @ %d -> %q\n", msg.Subject(), md.Sequence.Stream, string(msg.Data()))
+
+	kv.Put(ctx, "sue.color", []byte("yellow"))
+	msg, _ = cons.Next()
+	md, _ = msg.Metadata()
+	fmt.Printf("%s @ %d -> %q\n", msg.Subject(), md.Sequence.Stream, string(msg.Data()))
+
+	kv.Delete(ctx, "sue.color")
+	msg, _ = cons.Next()
+	md, _ = msg.Metadata()
+	fmt.Printf("%s @ %d -> %q\n", msg.Subject(), md.Sequence.Stream, msg.Data())
+
+	fmt.Printf("headers: %v\n", msg.Headers())
+
+	w, _ := kv.Watch(ctx, "sue.*")
+	defer w.Stop()
+
+	kv.Put(ctx, "sue.color", []byte("purple"))
+
+	kve := <-w.Updates()
+	fmt.Printf("%s @ %d -> %q (op: %s)\n", kve.Key(), kve.Revision(), string(kve.Value()), kve.Operation())
+
+	<-w.Updates()
+
+	kve = <-w.Updates()
+	fmt.Printf("%s @ %d -> %q (op: %s)\n", kve.Key(), kve.Revision(), string(kve.Value()), kve.Operation())
+
+	kv.Put(ctx, "sue.food", []byte("pizza"))
+
+	kve = <-w.Updates()
+	fmt.Printf("%s @ %d -> %q (op: %s)\n", kve.Key(), kve.Revision(), string(kve.Value()), kve.Operation())
 }
