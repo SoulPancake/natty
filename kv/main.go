@@ -17,7 +17,12 @@ func main() {
 	}
 
 	nc, _ := nats.Connect(url)
-	defer nc.Drain()
+	defer func(nc *nats.Conn) {
+		err := nc.Drain()
+		if err != nil {
+			fmt.Println("Error draining connection:", err)
+		}
+	}(nc)
 
 	js, _ := jetstream.New(nc)
 
